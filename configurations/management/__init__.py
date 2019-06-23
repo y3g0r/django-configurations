@@ -1,4 +1,4 @@
-from . import importer
+from .. import importer
 
 importer.install(check_options=True)
 
