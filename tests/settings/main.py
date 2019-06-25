@@ -33,6 +33,7 @@ class Test(Configuration):
         'django.contrib.auth',
         'django.contrib.admin',
         'tests',
+        'configurations',
     ]
 
     ROOT_URLCONF = 'tests.urls'
