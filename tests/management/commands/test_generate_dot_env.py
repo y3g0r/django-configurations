@@ -2,14 +2,12 @@ import ast
 import io
 import tempfile
 import textwrap
-from unittest import skip
 from unittest.mock import patch
 
 from django.core.management import call_command
 from django.test import TestCase
 
-from configurations.management.commands.generate_dot_env import Command, CustomisableVariablesFinder
-from configurations.generate_dot_env_utils import ValuesVisitor
+from configurations.management.commands.generate_dot_env import Command
 
 t = textwrap.dedent
 

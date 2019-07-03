@@ -1,322 +1,340 @@
 import ast
-import functools
-import json
-import re
-
 import astor
 
 
-class NodeVisitor(object):
-    """
-    A node visitor base class that walks the abstract syntax tree and calls a
-    visitor function for every node found.  This function may return a value
-    which is forwarded by the `visit` method.
+class EnvVar:
+    def __init__(self, environ_name=None, environ_prefix='DJANGO', default=None, tree=None, cls_name='Value'):
+        self.environ_name = environ_name
+        self.environ_prefix = environ_prefix
+        self.default = default
+        self._tree = tree
+        self._cls_name = cls_name
 
-    This class is meant to be subclassed, with the subclass adding visitor
-    methods.
+    @property
+    def name(self):
+        return self.environ_prefix + '_' + self.environ_name
 
-    Per default the visitor functions for the nodes are ``'visit_'`` +
-    class name of the node.  So a `TryFinally` node visit function would
-    be `visit_TryFinally`.  This behavior can be changed by overriding
-    the `visit` method.  If no visitor function exists for a node
-    (return value `None`) the `generic_visit` visitor is used instead.
+    @property
+    def type(self):
+        if self._cls_name == 'Value':
+            return 'String'
+        else:
+            return self._cls_name[:-len('Value')]
 
-    Don't use the `NodeVisitor` if you want to apply changes to nodes during
-    traversing.  For this a special visitor exists (`NodeTransformer`) that
-    allows modifications.
-    """
+    @property
+    def extra(self):
+        return ''
 
-    def visit(self, node):
-        """Visit a node."""
-        method = 'visit_' + node.__class__.__name__
-        visitor = getattr(self, method, self.generic_visit)
-        yield from visitor(node)
+    def set_positional(self, pos, node):
+        if pos == 0:
+            self._set_default(node)
+        else:
+            raise Exception('Unknown positional argument. Position: {}, Value: {}'.format(pos, node))
 
-    def generic_visit(self, node):
-        """Called if no explicit visitor function exists for a node."""
-        for field, value in ast.iter_fields(node):
-            if isinstance(value, list):
-                for item in value:
-                    if isinstance(item, ast.AST):
-                        yield from self.visit(item)
-            elif isinstance(value, ast.AST):
-                yield from self.visit(value)
-
-
-# noinspection PyPep8Naming
-class AssignCollector(ast.NodeVisitor):
-    def __init__(self):
-        self.assignments = {}
-
-    def traverse(self, tree):
-        self.visit(tree)
-        return self.assignments
-
-    def visit_Assign(self, node):
-        for target in node.targets:
-            if isinstance(target, ast.Name):
-                self.assignments[target.id] = node.value
-
-
-# noinspection PyPep8Naming
-class ValuesVisitor(NodeVisitor):
-    def __init__(self):
-        self.variables = []
-
-    def traverse(self, tree):
-        for _ in self.visit(tree):
+    def set_keyword(self, keyword, node):
+        if keyword == 'default':
+            self._set_default(node)
+        elif keyword == 'environ_name':
+            self._set_environ_name(node)
+        elif keyword == 'environ_prefix':
+            self._set_environ_prefix(node)
+        elif keyword in {'environ_required', 'alias', 'converter'}:
             pass
-        return self.variables
+        else:
+            raise Exception('''Unknown keyword argument. Keyword: '{}', value: {}'''.format(keyword, node))
+
+    def _set_environ_name(self, node):
+        """
+        KEY = values.Value()    : node is Name(identifier id, expr_context ctx), id=KEY, ctx=Store
+        KEY = values.Value(environ_name='FOO')  : node is Str(string s), s=FOO
+        bar='BAR'; KEY=values.Value(environ_name=bar)   : node is Name, id=bar, ctx=Load
+
+        :param node:
+        :type node: ast.Name or ast.Str
+        :return:
+        """
+        name = None
+        if isinstance(node, ast.Str):
+            name = node.s
+        elif isinstance(node, ast.Name):
+            if isinstance(node.ctx, ast.Store):
+                name = node.id
+            elif isinstance(node.ctx, ast.Load):
+                resolved_name = self._resolve_variable(node, tree=self._tree)
+                if resolved_name:
+                    name = resolved_name
+                else:
+                    raise Exception("Can't resolve variable {}".format(ast.dump(node)))
+
+        if name:
+            self.environ_name = name
+        else:
+            raise Exception("Unknown node type: {}".format(ast.dump(node)))
+
+    def _set_environ_prefix(self, node):
+        prefix = None
+        if isinstance(node, ast.Str):
+            prefix = node.s
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            resolved_prefix = self._resolve_variable(node, tree=self._tree)
+            if resolved_prefix:
+                prefix = resolved_prefix
+            else:
+                raise Exception("Can't resolve variable {}".format(ast.dump(node)))
+
+        if prefix:
+            self.environ_prefix = prefix
+        else:
+            raise Exception("Unknown node type: {}".format(ast.dump(node)))
+
+    def _set_default(self, default_node):
+        default = None
+        if isinstance(default_node, ast.Name):
+            for node in ast.walk(self._tree):
+                if isinstance(node, ast.Assign):
+                    for target in node.targets:
+                        if isinstance(target, ast.Name) and target.id == default_node.id:
+                            default = 'Variable: ' + astor.to_source(node).strip()
+        else:
+            default = self._node_to_source(default_node)
+        self.default = default
+
+    def _resolve_variable(self, variable_node, tree=None, depth=3):
+        """
+        Attempts to
+        :param variable_node:
+        :type variable_node: ast.Name
+        :param depth: how deep to recursively try to resolve variable.
+                     For example:
+                        a = 1
+                        b = a
+                        c = b
+                        _resolve_variable(c, depth=0) == b
+                        _resolve_variable(c, depth=1) == a
+                        _resolve_variable(c, depth=99999) == 1
+        """
+        if not tree:
+            raise Exception("Can not resolve variable {}. AST tree is not provided or empty.".format(
+                ast.dump(variable_node)
+            ))
+
+        # TODO: This is naive! Need to consider different scopes!
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id == variable_node.id:
+                        if isinstance(node.value, ast.Name) and depth:
+                            return self._resolve_variable(node.value, tree, depth=depth-1)
+                        else:
+                            return self._node_to_source(node.value)
+
+    def _node_to_source(self, node):
+        if isinstance(node, ast.Str):
+            return node.s
+        if isinstance(node, ast.Num):
+            return str(node.n)
+        else:
+            return astor.to_source(node).strip()
+
+    def __str__(self):
+        line = "# {name}{type}{default}{extra}"
+        name = self.name
+        type = ': ' + self.type
+        _default = self.default
+        if _default:
+            default = '=' + _default
+        else:
+            default = ''
+        extra = self.extra
+        return line.format(name=name, type=type, default=default, extra=extra)
+
+    __repr__ = __str__
+
+
+class _EnvVarWithExtra(EnvVar):
+    _extra_params = {}     # name: default
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._extra = {}
+        for name, default in self._extra_params.items():
+            self._extra[name] = kwargs.get(name, default)
+
+    def set_keyword(self, keyword, node):
+        if keyword in self._extra:
+            self._extra[keyword] = self._node_to_source(node)
+        else:
+            super().set_keyword(keyword=keyword, node=node)
+
+    @property
+    def extra(self):
+        line = super().extra
+        for name, value in self._extra.items():
+            line += ' ({param}={value})'.format(param=name, value=value)
+        return line
+
+
+class RegexEnvVar(_EnvVarWithExtra):
+    _extra_params = {'regex': None}
+
+    def set_positional(self, pos, node):
+        if pos == 1:
+            self._extra['regex'] = self._node_to_source(node)
+        else:
+            super().set_positional(pos=pos, node=node)
+
+
+class PathEnvVar(_EnvVarWithExtra):
+    _extra_params = {'checks_exists': True}
+
+
+class ListEnvVar(_EnvVarWithExtra):
+    empty_default = '[]'
+    _extra_params = {'separator': ','}
+
+    def _node_to_source(self, node):
+        if isinstance(node, ast.List) \
+                or isinstance(node, ast.Tuple) \
+                or isinstance(node, ast.Set):
+            dump = []
+            for element in node.elts:
+                dump.append(super()._node_to_source(element))
+            if not dump:
+                return self.empty_default
+            else:
+                return self._extra['separator'].join(dump)
+        else:
+            return super()._node_to_source(node)
+
+
+class TupleEnvVar(ListEnvVar):
+    empty_default = '()'
+
+
+class SetEnvVar(ListEnvVar):
+    empty_default = '{}'
+
+
+class SingleNestedListEnvVar(ListEnvVar):
+    _extra_params = {
+        'separator': ',',
+        'seq_separator': ';'
+    }
+
+    def _node_to_source(self, node):
+        if isinstance(node, ast.List) \
+                or isinstance(node, ast.Tuple):
+            dump = []
+            for element in node.elts:
+                dump.append(super()._node_to_source(element))
+            if not dump:
+                return self.empty_default
+            else:
+                return self._extra['seq_separator'].join(dump)
+        else:
+            return super()._node_to_source(node)
+
+
+class SingleNestedTupleEnvVar(SingleNestedListEnvVar):
+    empty_default = '()'
+
+
+VALUES_CLASSES_TO_ENV_VAR = {
+    'ListValue': ListEnvVar,
+    'TupleValue': TupleEnvVar,
+    'SingleNestedListValue': SingleNestedListEnvVar,
+    'SingleNestedTupleValue': SingleNestedTupleEnvVar,
+    'SetValue': SetEnvVar,
+    'RegexValue': RegexEnvVar,
+    'PathValue': PathEnvVar,
+    'BackendsValue': ListEnvVar,
+}
+
+
+def env_var_factory(cls_name, **kwargs):
+    env_var_cls = VALUES_CLASSES_TO_ENV_VAR.get(cls_name, EnvVar)
+    return env_var_cls(cls_name=cls_name, **kwargs)
+
+
+VALUE_CLASSES = [
+    'Value',
+    'BooleanValue',
+    'IntegerValue',
+    'PositiveIntegerValue',
+    'FloatValue',
+    'DecimalValue',
+    'ListValue',
+    'TupleValue',
+    'SingleNestedListValue',
+    'SingleNestedTupleValue',
+    'SetValue',
+    'DictValue',
+    'EmailValue',
+    'URLValue',
+    'IPValue',
+    'RegexValue',
+    'PathValue',
+    'DatabaseURLValue',
+    'CacheURLValue',
+    'EmailURLValue',
+    'SearchURLValue',
+    'BackendsValue',
+    'SecretValue',
+]
+
+
+# noinspection PyPep8Naming
+class CustomisableVariablesFinder(ast.NodeVisitor):
+    def __init__(self, tree):
+        self._tree = tree
+        self._variables = None
+        self._noname = None
+
+    def traverse(self, tree=None):
+        self._variables = []
+        if tree:
+            self._tree = tree
+        self.visit(self._tree)
+
+    @property
+    def variables(self):
+        if self._variables is None:
+            self.traverse()
+        return self._variables
 
     def visit_Assign(self, node):
-        for env_var in self.generic_visit(node):
-            if env_var:
-                env_var.environ_name = node.targets[0].id
-                self.variables.append(env_var)
-                yield
+        self.generic_visit(node)
+        if self._noname:
+            variable = self._noname
+            self._noname = None
+            variable.set_keyword('environ_name', node.targets[0])
+            self.variables.append(variable)
 
     def visit_Call(self, node):
-        cls_name = self._get_values_cls_name(node.func)
+        cls_name = self._values_cls_name(node.func)
         if not cls_name:
-            yield from self.generic_visit(node)
             return
-
-        env_var = env_variable_factory(cls_name=cls_name, node=node)
-        for keyword in node.keywords:
-            if keyword.arg == 'environ':
-                if keyword.value.value is False:
-                    return
-            setattr(env_var, keyword.arg, keyword.value)
-
+        env_var = env_var_factory(cls_name=cls_name, tree=self._tree)
+        for kwarg in node.keywords:
+            if kwarg.arg == 'environ' and kwarg.value.value is False:
+                return
+            env_var.set_keyword(kwarg.arg, kwarg.value)
         for pos, arg in enumerate(node.args):
-            env_var.store_positional_arg(pos, arg)
+            env_var.set_positional(pos, arg)
 
         if env_var.environ_name:
             self.variables.append(env_var)
         else:
-            yield env_var
+            self._noname = env_var
 
     @staticmethod
-    def _get_values_cls_name(node):
-        name = None
-        if isinstance(node, ast.Name):
-            name = node.id
-        elif isinstance(node, ast.Attribute):
-            if isinstance(node.value, ast.Name) and node.value.id == 'values':
-                name = node.attr
+    def _values_cls_name(func_node):
+        if isinstance(func_node, ast.Name):
+            name = func_node.id
+        elif isinstance(func_node, ast.Attribute):
+            name = func_node.attr
+        else:
+            raise Exception("Don't know how to get class name from {}".format(ast.dump(func_node)))
 
-        if name in VALUES_CLASSES:
+        if name in VALUE_CLASSES:
             return name
-
-
-class EnvVar:
-    def __init__(self, node, environ_prefix='DJANGO', environ_name=None, default=None, cls_name='Value'):
-        self.environ_name = environ_name
-        self.environ_prefix = environ_prefix
-        self.node = node
-        self.default = default
-        self.values_cls_name = cls_name
-
-    def store_positional_arg(self, pos, value):
-        if pos == 0:
-            self.default = value
-        else:
-            raise Exception('Unknown positional argument. Position: {}, value: {}'.format(pos, ast.dump(value)))
-
-    def _str_default(self):
-        return self.default
-
-    def _extra_strings(self):
-        return []
-
-    def __str__(self):
-        full_name = "{}_{}".format(self.environ_prefix, self.environ_name)
-        default_value = self._str_default()
-        extra = self._extra_strings()
-
-        full_string = full_name
-
-        if default_value:
-            full_string += "={}".format(default_value)
-        if extra:
-            full_string += ' ({})'.format((', '.join(extra)))
-
-        return full_string
-
-    def __repr__(self):
-        return "EnvVar(prefix={!r}, name={!r}, default={!r})".format(
-            self.environ_prefix,
-            self.environ_name,
-            self.default
-        )
-
-
-class BooleanEnvVar(EnvVar):
-    def _str_default(self):
-        if self.default:
-            return 'true'
-        else:
-            return 'false'
-
-
-class RegexEnvVar(EnvVar):
-    def __init__(self, regex=None, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.regex = regex
-
-    def _extra_strings(self):
-        return ['regex: {}'.format(self.regex)]
-
-    def store_positional_arg(self, pos, value):
-        if pos == 1:
-            self.regex = value
-        else:
-            super().store_positional_arg(pos, value)
-
-
-class SequenceEnvVar(EnvVar):
-    def __init__(self, separator=',', *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.separator = separator
-
-    def _str_default(self):
-        return self.default and self.default\
-                    .replace(',', self.separator)\
-                    .replace('(', '')\
-                    .replace(')', '')\
-                    .replace("'", "")
-
-
-class NestedSequenceEnvVar(SequenceEnvVar):
-    def __init__(self, seq_separator=';', *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.seq_separator = seq_separator
-
-    def _str_default(self):
-        translate_table = {
-            '),(': self.seq_separator,
-            '],[': self.seq_separator,
-            ',': self.separator,
-            '(': '',
-            ')': '',
-            '[': '',
-            ']': '',
-            '\'': ''
-        }
-        result = self.default
-        if result:
-            for k, v in translate_table.items():
-                result = result.replace(k, v)
-        return result
-
-
-VALUES_CLASSES = {
-    'Value': EnvVar,
-    'BooleanValue': EnvVar,
-    'IntegerValue': EnvVar,
-    'PositiveIntegerValue': EnvVar,
-    'FloatValue': EnvVar,
-    'DecimalValue': EnvVar,
-    'ListValue': SequenceEnvVar,
-    'TupleValue': SequenceEnvVar,
-    'SingleNestedListValue': NestedSequenceEnvVar,
-    'SingleNestedTupleValue': NestedSequenceEnvVar,
-    'BackendsValue': EnvVar,
-    'SetValue': EnvVar,
-    'DictValue': EnvVar,
-    'EmailValue': EnvVar,
-    'URLValue': EnvVar,
-    'IPValue': EnvVar,
-    'RegexValue': RegexEnvVar,
-    'PathValue': EnvVar,
-    'SecretValue': EnvVar,
-    'EmailURLValue': EnvVar,
-    'DictBackendMixin': EnvVar,
-    'DatabaseURLValue': EnvVar,
-    'CacheURLValue': EnvVar,
-    'SearchURLValue': EnvVar,
-}
-
-
-def env_variable_factory(cls_name, **kwargs):
-    cls = VALUES_CLASSES.get(cls_name)
-    return cls(**kwargs, cls_name=cls_name)
-
-
-class EnvVarFormatter:
-    def __init__(self, assignment_lookup_table=None):
-        self._assignments = assignment_lookup_table
-
-    @staticmethod
-    def _str_node_to_src(node):
-        return node.s
-
-    @staticmethod
-    def _name_const_node_to_src(node):
-        return json.dumps(node.value)
-
-    @staticmethod
-    def _num_node_to_src(node):
-        return node.n
-
-    def _name_node_to_src(self, node, resolve):
-
-        if resolve:
-            return self._try_to_resolve_variable(node.id)
-        return node.id
-
-    @staticmethod
-    def _generic_node_to_src(node):
-        return re.sub(r'\s+', '', astor.to_source(node))
-
-    def _to_source_code(self, node, resolve_variables=False):
-        if not issubclass(type(node), ast.AST):
-            return node
-
-        nodes_to_src = {
-            ast.Name: functools.partial(self._name_node_to_src, resolve=resolve_variables),
-            ast.NameConstant: self._name_const_node_to_src,
-            ast.Num: self._num_node_to_src,
-            ast.Str: self._str_node_to_src,
-        }
-        node_to_src = nodes_to_src.get(type(node), self._generic_node_to_src)
-        return node_to_src(node)
-
-    def _try_to_resolve_variable(self, name_node):
-        node = self._assignments.get(name_node)
-        if node:
-            return self._to_source_code(node)
-        else:
-            return name_node
-
-    def format_line(self, variable):
-
-        name = self.format_name(variable)
-
-        line = "export {name}=".format(name=name)
-
-        default = self.format_default(variable)
-        if default:
-            line = "# {line}(Default: {default})".format(line=line, default=default)
-
-        extras = self.format_extras(variable)
-        if extras:
-            line = "{line}FIXME: {extras}".format(line=line, extras=extras)
-
-        return line
-
-    def format_name(self, variable):
-        return "{prefix}_{name}".format(
-            prefix=self._to_source_code(variable.environ_prefix, resolve_variables=True),
-            name=self._to_source_code(variable.environ_name, resolve_variables=True),
-        )
-
-    def format_default(self, variable):
-        if variable.default is None:
-            return ''
-        else:
-            return self._to_source_code(variable.default)
-
-    def format_extras(self, variable):
-        return ''
-
