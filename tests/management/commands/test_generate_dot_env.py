@@ -739,3 +739,79 @@ class CommandTest(TestCase):
             ))
         )
 
+    def test_sorting_off(self):
+
+        code = t("""\
+        from configurations import Configuration, values
+        
+        class Settings(Configuration):
+            KEY__ = values.Value()
+            KEY_A = values.Value()
+            KEY_Z = values.Value()
+            KEY_0 = values.Value()
+            KEY_1 = values.Value()
+            KEY_9 = values.Value()
+            KEY_10 = values.Value()
+        """)
+        buf = io.StringIO()
+        with patch('sys.stdin.read', side_effect=[code]):
+            call_command('generate_dot_env', stdout=buf)
+
+        self.assertEqual(
+            [
+                '# DJANGO_KEY__: String',
+                'export DJANGO_KEY__=',
+                '# DJANGO_KEY_A: String',
+                'export DJANGO_KEY_A=',
+                '# DJANGO_KEY_Z: String',
+                'export DJANGO_KEY_Z=',
+                '# DJANGO_KEY_0: String',
+                'export DJANGO_KEY_0=',
+                '# DJANGO_KEY_1: String',
+                'export DJANGO_KEY_1=',
+                '# DJANGO_KEY_9: String',
+                'export DJANGO_KEY_9=',
+                '# DJANGO_KEY_10: String',
+                'export DJANGO_KEY_10=',
+            ],
+            buf.getvalue().splitlines()
+        )
+
+    def test_sorting_on(self):
+
+        code = t("""\
+        from configurations import Configuration, values
+        
+        class Settings(Configuration):
+            KEY__ = values.Value()
+            KEY_A = values.Value()
+            KEY_Z = values.Value()
+            KEY_0 = values.Value()
+            KEY_1 = values.Value()
+            KEY_9 = values.Value()
+            KEY_10 = values.Value()
+        """)
+        buf = io.StringIO()
+        with patch('sys.stdin.read', side_effect=[code]):
+            call_command('generate_dot_env', '--sort', stdout=buf)
+        self.assertEqual(
+            [
+
+                '# DJANGO_KEY_0: String',
+                'export DJANGO_KEY_0=',
+                '# DJANGO_KEY_1: String',
+                'export DJANGO_KEY_1=',
+                '# DJANGO_KEY_10: String',
+                'export DJANGO_KEY_10=',
+                '# DJANGO_KEY_9: String',
+                'export DJANGO_KEY_9=',
+                '# DJANGO_KEY_A: String',
+                'export DJANGO_KEY_A=',
+                '# DJANGO_KEY_Z: String',
+                'export DJANGO_KEY_Z=',
+                '# DJANGO_KEY__: String',
+                'export DJANGO_KEY__=',
+            ],
+            buf.getvalue().splitlines()
+        )
+

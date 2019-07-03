@@ -7,15 +7,16 @@ from configurations.generate_dot_env_utils import CustomisableVariablesFinder
 
 
 class Command(BaseCommand):
-    help = 'Closes the specified poll for voting'
+    help = 'Generates .env file template'
 
     def add_arguments(self, parser):
         parser.add_argument('-i', '--input')
+        parser.add_argument('--sort', action='store_true')
 
     def handle(self, *args, **options):
         settings_file = options['input']
         parsed_settings = self.process(settings_file)
-        printable_dump = self.dump(parsed_settings)
+        printable_dump = self.dump(parsed_settings, sort=options['sort'])
         self.stdout.write(printable_dump)
 
     def process(self, settings_file):
@@ -50,7 +51,12 @@ class Command(BaseCommand):
         finder = CustomisableVariablesFinder(parsed_settings)
 
         result = []
-        for variable in finder.variables:
+
+        variables = finder.variables
+        if sort:
+            variables.sort(key=lambda v: v.name)
+
+        for variable in variables:
             result.append(Command.dump_single_variable_specs(variable))
             result.append(Command.dump_single_variable(variable))
 
